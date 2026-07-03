@@ -23,6 +23,7 @@ class SystemState(BaseModel):
     market_data: Dict[str, Any] = {}
     audit_payload: Dict[str, Any] = {}
     content_generation: Dict[str, Any] = {}
+    executive_impact: Dict[str, Any] = {}
 
 # ==========================================
 # Tool Functions (Connecting to FastAPI MCP Server)
@@ -129,7 +130,7 @@ def generate_content_with_retry(client, model, contents, config, max_retries=5, 
             time.sleep(wait_time)
             delay *= 2  # double for next potential retry
 
-def run_agent_loop(client: genai.Client, model: str, instruction: str, initial_prompt: str, tools: list) -> str:
+def run_agent_loop(client: genai.Client, model: str, instruction: str, initial_prompt: str, tools: list, image_data: dict = None) -> str:
     """Manually handles the tool-calling loop using generate_content."""
     config = types.GenerateContentConfig(
         system_instruction=instruction,
@@ -137,8 +138,12 @@ def run_agent_loop(client: genai.Client, model: str, instruction: str, initial_p
         temperature=0.2
     )
     
+    parts = [types.Part.from_text(text=initial_prompt)]
+    if image_data:
+        parts.append(types.Part.from_bytes(data=image_data["bytes"], mime_type=image_data["mime_type"]))
+        
     contents = [
-        types.Content(role="user", parts=[types.Part.from_text(text=initial_prompt)])
+        types.Content(role="user", parts=parts)
     ]
     
     while True:
@@ -205,7 +210,7 @@ def run_agent_a(state: SystemState, client: genai.Client):
     
     result = run_agent_loop(
         client=client, 
-        model="gemini-3.5-flash", 
+        model="gemini-3.1-flash-lite", 
         instruction=instruction, 
         initial_prompt=f"Please process SKU: {state.sku_to_audit}",
         tools=tools
@@ -214,8 +219,8 @@ def run_agent_a(state: SystemState, client: genai.Client):
     print(f"[Agent A Output]\\n{result}")
     state.market_data["summary"] = result
 
-def run_agent_b(state: SystemState, client: genai.Client):
-    print(f"\\n[Agent B: Catalog Auditor] Running for SKU: {state.sku_to_audit}...")
+def run_agent_b(state: SystemState, client: genai.Client, image_data: dict = None):
+    print(f"\n[Agent B: Catalog Auditor] Running for SKU: {state.sku_to_audit}...")
     instruction = """
     You are Agent B (The Catalog Auditor).
     Your goal is to enforce structural guardrails on the SKU provided to you.
@@ -224,22 +229,25 @@ def run_agent_b(state: SystemState, client: genai.Client):
     3. Determine the list of materials (e.g. ['Platinum', 'Gold'] if it's two-tone based on description/material).
     4. Use the validate_two_tone_isolation tool to check if the SKU structure is valid.
     5. If validate_two_tone_isolation returns valid=False, use the flag_for_human_review tool and explicitly state "Upload Blocked: Two-tone item identified. Must be generated as a distinct SKU." in your final response.
+    6. If an image is provided, first verify it actually depicts a jewelry product (ring, necklace, bracelet, earring, pendant, etc.). If the image does NOT contain any jewelry product — for example it is a scenery, landscape, animal, person, food, random object, or anything unrelated to jewelry — immediately use the flag_for_human_review tool and state "Visual Mismatch Error: Invalid Input Image" in your final response. Do NOT proceed with material cross-referencing for non-jewelry images.
+    7. If the image IS a jewelry product, cross-reference the visual material in the image with the declared material in the database. If gold (yellowish metal) is visually detected on a pure platinum SKU, explicitly state "Visual Mismatch Error: Material Discrepancy Detected" in your final response and use the flag_for_human_review tool.
     
-    Output a clear audit status ('APPROVED' or 'BLOCKED') and the associated error message if any.
+    Output a clear audit status ('APPROVED', 'BLOCKED', 'Visual Mismatch Error: Invalid Input Image', or 'Visual Mismatch Error: Material Discrepancy Detected') and the associated error message if any.
     """
     
     tools = [query_local_inventory, validate_two_tone_isolation, flag_for_human_review]
     
     result = run_agent_loop(
         client=client, 
-        model="gemini-3.1-flash-lite", 
+        model="gemini-2.5-flash", 
         instruction=instruction, 
         initial_prompt=f"Please audit SKU: {state.sku_to_audit}. Market summary: {state.market_data.get('summary')}",
-        tools=tools
+        tools=tools,
+        image_data=image_data
     )
     
     print(f"[Agent B Output]\\n{result}")
-    state.audit_payload["summary"] = result
+    state.audit_payload["summary"] = result or "Visual Mismatch Error: Agent B flagged this SKU for human review."
 
 def run_agent_c(state: SystemState, client: genai.Client):
     print(f"\\n[Agent C: Brand Voice Copywriter] Running for SKU: {state.sku_to_audit}...")
@@ -263,21 +271,118 @@ def run_agent_c(state: SystemState, client: genai.Client):
     prompt = f"Please write copy for SKU: {state.sku_to_audit}. Audit Results: {state.audit_payload.get('summary')}"
     response = generate_content_with_retry(
         client=client,
-        model="gemini-3.5-flash",
+        model="gemini-3.1-flash-lite",
         contents=prompt,
         config=config
     )
     
     result = response.text
     print(f"[Agent C Output]\\n{result}")
+    print(f"[Agent C Output]\n{result}")
     state.content_generation["summary"] = result
+
+def refine_agent_c_copy(current_text: str, user_feedback: str) -> str:
+    """Refines Agent C's generated copy based on human feedback without re-running Agents A/B."""
+    load_dotenv(override=True)
+    api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError("No API key found. Set GOOGLE_API_KEY or GEMINI_API_KEY in your .env file.")
+    client = genai.Client(api_key=api_key)
+
+    instruction = """
+    You are a luxury brand copywriter refining existing product copy based on human feedback.
+    
+    CRITICAL CONSTRAINTS:
+    - Maintain simplicity and sophistication aligned with a luxury brand identity.
+    - Use ZERO aggressive promotional language or buzzwords.
+    - Apply the user's refinement instructions while preserving the core product information.
+    - Output ONLY the revised copy, cleanly formatted. Do not add commentary about the changes.
+    """
+
+    config = types.GenerateContentConfig(
+        system_instruction=instruction,
+        temperature=0.4
+    )
+
+    prompt = f"""Here is the current product copy:
+
+---
+{current_text}
+---
+
+The human reviewer has provided the following refinement instructions:
+"{user_feedback}"
+
+Please revise the copy accordingly."""
+
+    print(f"\n[Agent C Refinement] Processing feedback: {user_feedback}")
+    response = generate_content_with_retry(
+        client=client,
+        model="gemini-3.1-flash-lite",
+        contents=prompt,
+        config=config
+    )
+
+    result = response.text
+    print(f"[Agent C Refined Output]\n{result}")
+    return result
+
+# ==========================================
+# Executive Impact Calculator
+# ==========================================
+def calculate_executive_impact(state: SystemState):
+    """Scans the final SystemState for flagged errors and calculates simulated revenue protected."""
+    import sqlite3
+    
+    errors_found = []
+    market_summary = state.market_data.get("summary", "") or ""
+    audit_summary = state.audit_payload.get("summary", "") or ""
+    
+    # Check Agent A: Margin violations
+    if "[MARGIN_VIOLATION]" in market_summary:
+        errors_found.append("Margin Drop Below Threshold")
+    
+    # Check Agent B: SKU / visual errors
+    if "BLOCKED" in audit_summary.upper() or "Upload Blocked" in audit_summary:
+        errors_found.append("Two-Tone SKU Isolation Failure")
+    if "Invalid Input Image" in audit_summary:
+        errors_found.append("Invalid Input Image")
+    if "Material Discrepancy" in audit_summary or ("Visual Mismatch Error" in audit_summary and "Invalid Input Image" not in audit_summary):
+        errors_found.append("Visual Material Mismatch")
+    
+    # Fetch the SKU's retail price from the database as the MSRP
+    avg_msrp = 1500.00  # Fallback default
+    try:
+        conn = sqlite3.connect("file:mock_inventory.sqlite?mode=ro", uri=True)
+        cursor = conn.cursor()
+        cursor.execute("SELECT retail_price FROM inventory WHERE sku_id = ?", (state.sku_to_audit,))
+        row = cursor.fetchone()
+        conn.close()
+        if row:
+            avg_msrp = row[0]
+    except Exception:
+        pass  # Use fallback
+    
+    error_count = len(errors_found)
+    revenue_protected = error_count * avg_msrp
+    
+    impact = {
+        "error_count": error_count,
+        "errors": errors_found,
+        "sku_msrp": avg_msrp,
+        "revenue_protected": revenue_protected,
+        "summary": f"Protected ${revenue_protected:,.2f} by intercepting {error_count} non-compliant issue(s) on SKU {state.sku_to_audit}." if error_count > 0 else "No compliance issues detected. SKU cleared for storefront."
+    }
+    
+    print(f"\n[Executive Impact] {impact['summary']}")
+    state.executive_impact = impact
 
 # ==========================================
 # Orchestration Execution
 # ==========================================
-async def run_pipeline(target_sku: str) -> dict:
+async def run_pipeline(target_sku: str, image_data: dict = None) -> dict:
     """Main pipeline execution replacing ADK orchestrator. Kept async to maintain compatibility with dashboard.py"""
-    print(f"\\n--- Initiating Vanilla Python Pipeline for SKU: {target_sku} ---")
+    print(f"\n--- Initiating Vanilla Python Pipeline for SKU: {target_sku} ---")
 
     # ── Fix 1: Force-reload .env so a rotated API key is picked up immediately
     # without restarting the process. override=True overwrites any previously
@@ -305,7 +410,7 @@ async def run_pipeline(target_sku: str) -> dict:
             # Per-call throttle inside generate_content_with_retry handles
             # rate-limiting; a short courtesy pause between agents is enough.
             time.sleep(2)
-            run_agent_b(state, client)
+            run_agent_b(state, client, image_data)
             time.sleep(2)
             run_agent_c(state, client)
             break  # Success
@@ -318,6 +423,11 @@ async def run_pipeline(target_sku: str) -> dict:
                 state.audit_payload["summary"] = f"Pipeline execution error: {str(e)}"
     
     final_state_dict = state.model_dump()
+    
+    # Post-pipeline: Calculate executive impact
+    calculate_executive_impact(state)
+    final_state_dict = state.model_dump()
+    
     print("\\n=== FINAL SYSTEM STATE ===")
     print(json.dumps(final_state_dict, indent=2))
     print("--------------------------------------------------\\n")

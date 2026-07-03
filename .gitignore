@@ -20,3 +20,8 @@ __pycache__/
 # OS generated files
 .DS_Store
 Thumbs.db
+
+# Exclude project PDFs
+PRD_Autonomous_Ecommerce.pdf
+TDD_Autonomous_Ecommerce.pdf
+UI_UX_Design_Specification.pdf

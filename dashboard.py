@@ -122,6 +122,7 @@ with col_header_right:
     st.write("") # Spacer
     skus_list = get_skus()
     selected_sku_raw = st.selectbox("Select SKU to Audit", skus_list, label_visibility="collapsed")
+    uploaded_image = st.file_uploader("Upload SKU Image", type=["png", "jpg", "jpeg"])
     initiate_btn = st.button("Initiate Audit Cycle", use_container_width=True)
 
 st.divider()
@@ -129,21 +130,84 @@ st.divider()
 # Session State to hold results
 if "audit_results" not in st.session_state:
     st.session_state.audit_results = None
+if "agent_c_copy" not in st.session_state:
+    st.session_state.agent_c_copy = ""
 
 if initiate_btn:
     if selected_sku_raw and "Error" not in selected_sku_raw:
         target_sku = selected_sku_raw.split(" - ")[0]
+        
+        image_data = None
+        if uploaded_image is not None:
+            image_data = {
+                "bytes": uploaded_image.getvalue(),
+                "mime_type": uploaded_image.type
+            }
+
         with st.spinner(f"Running Multi-Agent Pipeline for {target_sku}..."):
             try:
                 # Run the ADK Orchestrator
-                final_state = asyncio.run(adk_orchestrator.run_pipeline(target_sku))
+                final_state = asyncio.run(adk_orchestrator.run_pipeline(target_sku, image_data))
                 st.session_state.audit_results = final_state
+                # Store Agent C copy in session state for HITL refinement
+                agent_c_text = final_state.get("content_generation", {}).get("summary", "") or ""
+                st.session_state.agent_c_copy = agent_c_text
             except Exception as e:
                 st.error(f"Pipeline Execution Failed: {str(e)}")
 
 # Display Results if available
 if st.session_state.audit_results:
     results = st.session_state.audit_results
+    
+    # ── Executive Impact Card ──
+    impact = results.get("executive_impact", {})
+    if impact:
+        revenue = impact.get("revenue_protected", 0)
+        error_count = impact.get("error_count", 0)
+        impact_summary = impact.get("summary", "")
+        errors_list = impact.get("errors", [])
+        
+        if error_count > 0:
+            st.markdown(f"""
+            <div style="background: linear-gradient(135deg, #2B2B2B 0%, #3D3D3D 100%); 
+                        border-radius: 12px; padding: 28px 32px; margin-bottom: 24px;
+                        border-left: 4px solid #B89B72; box-shadow: 0 4px 12px rgba(0,0,0,0.15);">
+                <div style="font-family: 'Inter', sans-serif; color: #B89B72; font-size: 0.75em; 
+                            text-transform: uppercase; letter-spacing: 2px; margin-bottom: 8px;">
+                    Executive Impact — Revenue Protected
+                </div>
+                <div style="font-family: 'Playfair Display', serif; color: #FFFFFF; font-size: 2.4em; 
+                            font-weight: 600; margin-bottom: 6px;">
+                    ${revenue:,.2f}
+                </div>
+                <div style="font-family: 'Inter', sans-serif; color: #CCCCCC; font-size: 0.9em;">
+                    {impact_summary}
+                </div>
+                <div style="font-family: 'Inter', sans-serif; color: #C48787; font-size: 0.8em; margin-top: 10px;">
+                    Issues intercepted: {', '.join(errors_list)}
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            st.markdown(f"""
+            <div style="background: linear-gradient(135deg, #2B2B2B 0%, #3D3D3D 100%); 
+                        border-radius: 12px; padding: 28px 32px; margin-bottom: 24px;
+                        border-left: 4px solid #8CA58A; box-shadow: 0 4px 12px rgba(0,0,0,0.15);">
+                <div style="font-family: 'Inter', sans-serif; color: #8CA58A; font-size: 0.75em; 
+                            text-transform: uppercase; letter-spacing: 2px; margin-bottom: 8px;">
+                    Executive Impact — Compliance Status
+                </div>
+                <div style="font-family: 'Playfair Display', serif; color: #FFFFFF; font-size: 1.6em; 
+                            font-weight: 600; margin-bottom: 6px;">
+                    ✅ All Clear
+                </div>
+                <div style="font-family: 'Inter', sans-serif; color: #CCCCCC; font-size: 0.9em;">
+                    {impact_summary}
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+    
+    st.divider()
     
     st.markdown("<h3>Section 1: The Market Monitor (Agent A)</h3>", unsafe_allow_html=True)
     
@@ -167,10 +231,14 @@ if st.session_state.audit_results:
     
     st.markdown("<h3>Section 2: Catalog & SKU Auditor (Agent B)</h3>", unsafe_allow_html=True)
     
-    audit_summary = results.get("audit_payload", {}).get("summary", "")
+    audit_summary = results.get("audit_payload", {}).get("summary", "") or ""
     st.markdown(f"<div class='output-card'>{audit_summary}</div>", unsafe_allow_html=True)
     
-    if "BLOCKED" in audit_summary.upper() or "Upload Blocked" in audit_summary:
+    if "Invalid Input Image" in audit_summary:
+        st.markdown("<div class='alert-box'>🚨 Visual Mismatch Error: Invalid input image — uploaded file is not a jewelry product.</div>", unsafe_allow_html=True)
+    elif "Material Discrepancy" in audit_summary or "Visual Mismatch Error" in audit_summary:
+        st.markdown("<div class='alert-box'>🚨 Visual Mismatch Error: Gold detected on a pure platinum SKU.</div>", unsafe_allow_html=True)
+    elif "BLOCKED" in audit_summary.upper() or "Upload Blocked" in audit_summary:
         st.markdown("<div class='alert-box'>❌ Upload Blocked: Two-tone item identified. Must be generated as a distinct SKU.</div>", unsafe_allow_html=True)
     elif "APPROVED" in audit_summary.upper():
         st.markdown("<div class='success-box'>✅ SKU Validation Passed.</div>", unsafe_allow_html=True)
@@ -179,13 +247,45 @@ if st.session_state.audit_results:
     
     st.markdown("<h3>Section 3: Brand Voice Output (Agent C)</h3>", unsafe_allow_html=True)
     
-    content_summary = results.get("content_generation", {}).get("summary", "")
+    content_summary = results.get("content_generation", {}).get("summary", "") or ""
     
-    if "BLOCKED" in audit_summary.upper() or "Upload Blocked" in audit_summary:
+    if "BLOCKED" in audit_summary.upper() or "Upload Blocked" in audit_summary or "Visual Mismatch Error" in audit_summary or "Invalid Input Image" in audit_summary:
         st.info("Copywriting was bypassed due to validation failure in Agent B.")
     else:
-        st.markdown("<div class='secondary-text' style='margin-bottom: 10px;'>Draft Card</div>", unsafe_allow_html=True)
-        # Using Streamlit's code block for easy copy-to-clipboard functionality
-        st.code(content_summary, language="markdown")
+        st.markdown("<div class='secondary-text' style='margin-bottom: 10px;'>Draft Card — Human-in-the-Loop Review</div>", unsafe_allow_html=True)
+        
+        # Editable text area with Agent C's generated copy
+        edited_copy = st.text_area(
+            "Generated Copy (editable)",
+            value=st.session_state.agent_c_copy,
+            height=300,
+            label_visibility="collapsed"
+        )
+        
+        # Refinement instructions input
+        refinement_instructions = st.text_input(
+            "Refinement Instructions",
+            placeholder="e.g., 'Make it more minimalist', 'Remove the tagline', 'Shorten to 2 sentences'"
+        )
+        
+        # Refine Copy button
+        refine_btn = st.button("Refine Copy", use_container_width=True)
+        
+        if refine_btn:
+            if refinement_instructions.strip():
+                with st.spinner("Refining copy with Agent C..."):
+                    try:
+                        refined = adk_orchestrator.refine_agent_c_copy(
+                            current_text=edited_copy,
+                            user_feedback=refinement_instructions
+                        )
+                        st.session_state.agent_c_copy = refined
+                        # Also update the stored results
+                        st.session_state.audit_results["content_generation"]["summary"] = refined
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Refinement Failed: {str(e)}")
+            else:
+                st.warning("Please enter refinement instructions before clicking Refine Copy.")
 else:
     st.info("Select a SKU and click 'Initiate Audit Cycle' to view the operations dashboard.")
